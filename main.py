@@ -9,7 +9,8 @@ from io import BytesIO
 from PIL import Image
 import cv2
 from collections import defaultdict
-from models.videoclip_xl_v2 import VideoCLIP_XL_v2_v, VideoCLIP_XL_v2_t
+from models.base import BaseModel
+from models.videoclip_xl_v2 import VideoCLIP_XL_v2
 
 class Index:
     def __init__(self, dim: int, name: str):
@@ -104,22 +105,21 @@ class Index:
             os.remove(f"indexes/{self.name}.names")
 
 class Model:
-    def __init__(self, name: str, vfunc, tfunc, dim: int, res: tuple[int, int], fcount: int):
+    def __init__(self, name: str, model: BaseModel, dim: int, res: tuple[int, int], fcount: int):
         self.name = name
-        self.vfunc = vfunc
-        self.tfunc = tfunc
+        self.model = model
         self.dim = dim
         self.res = res
         self.fcount = fcount
 
 MODELS = [
-    Model("VideoCLIP-XL-v2", VideoCLIP_XL_v2_v, VideoCLIP_XL_v2_t, 768, (224, 224), 8),
+    Model("VideoCLIP-XL-v2", VideoCLIP_XL_v2(), 768, (224, 224), 8),
 ]
 
 class CLIPQueueProcessor:
     def __init__(self):
-        self.vqueues = defaultdict(list)
-        self.tqueues = defaultdict(list)
+        self.vqueues: defaultdict[int, list] = defaultdict(list)
+        self.tqueues: defaultdict[int, list] = defaultdict(list)
         self.lock = Lock()
         self.event = Event()
         self.sleeping = True
@@ -169,10 +169,10 @@ class CLIPQueueProcessor:
                     inputs.append(_input)
 
                 if video:
-                    for i, vector in enumerate(MODELS[model_index].vfunc(inputs)):
+                    for i, vector in enumerate(MODELS[model_index].model.process_videos(inputs)):
                         callbacks[i](vector)
                 else:
-                    for i, vector in enumerate(MODELS[model_index].tfunc(inputs)):
+                    for i, vector in enumerate(MODELS[model_index].model.process_texts(inputs)):
                         callbacks[i](vector)
 
 class UserIndexStore:
