@@ -1,0 +1,13 @@
+faiss-cpu
+opencv-python
+timm
+einops
+torch
+torchvision
+numpy
+requests
+flask
+pillow
+ftfy
+regex
+discord-protos

@@ -1,0 +1,5 @@
+frecency_user_settings.txt
+indexes/
+.venv/
+__pycache__/
+models/videoclip_xl_v2/VideoCLIP-XL-v2.bin
