@@ -44,6 +44,7 @@ class Index:
             self.names: list[str] = []
 
         self.name = name
+        self.save_lock = Lock()
 
     def __contains__(self, name: str) -> bool:
         return name in self.names
@@ -93,11 +94,12 @@ class Index:
         return self.index.reconstruct(idx)
     
     def save(self):
-        faiss.write_index(self.index, f"indexes/{self.name}.index")
-        with open(f"indexes/{self.name}.names", 'wb') as f:
-            for name in self.names:
-                f.write(struct.pack('H', len(name)))
-                f.write(name.encode('utf-8'))
+        with self.save_lock:
+            faiss.write_index(self.index, f"indexes/{self.name}.index")
+            with open(f"indexes/{self.name}.names", 'wb') as f:
+                for name in self.names:
+                    f.write(struct.pack('H', len(name)))
+                    f.write(name.encode('utf-8'))
 
     def clear(self):
         self.index.reset()
@@ -215,6 +217,31 @@ class UserIndexStore:
         
         return self.indexes[model_index].search(vectors, k)
 
+    def status(self, name: str) -> tuple[set[int], set[int], set[int], set[int], set[int]]:
+        remaining = set(range(len(MODELS)))
+
+        processing = set()
+        downloading = set()
+        missing = set()
+        failed = set()
+        with self.in_progress_v_lock:
+            completed = set(filter(lambda m: self.get(m, name) is not None, remaining))
+            remaining -= completed
+            if not remaining:
+                return failed, missing, downloading, processing, completed
+
+            for model_idx in remaining:
+                status = self.get_state(name, model_idx)
+                if status == State.PROCESSING:
+                    processing.add(model_idx)
+                elif status == State.DOWNLOADING:
+                    downloading.add(model_idx)
+                elif status == State.FAILED:
+                    failed.add(model_idx)
+                else:
+                    missing.add(model_idx)
+        return failed, missing, downloading, processing, completed
+
 class IndexDestination:
     def __init__(self, name: str, user_index: UserIndexStore):
         self.name = name
@@ -321,12 +348,12 @@ class Indexer:
             for destination in job.destinations:
                 destination.user_index.add(model_index, destination.name, vector)
 
-    def _download_media(self, media_src: str):
+    def _download_media(self, url: str, media_src: str):
         failed = True
         required_models = self.in_progress_v_dl[media_src]
         popped = False
         try:
-            r = requests.get(media_src, stream=True)
+            r = requests.get(url, stream=True)
             if "content-length" not in r.headers or "content-type" not in r.headers:
                 return
 
@@ -361,14 +388,19 @@ class Indexer:
             failed = False
         finally:
             with self.in_progress_v_lock:
-                if failed: self.failed_media_dl.add(media_src)
+                if failed: self.failed_media_dl.add(url)
                 for model_idx, destinations in required_models.items():
                     for destination in destinations:
                         destination.user_index.set_state(destination.name, model_idx, State.FAILED if failed else State.PROCESSING)
                 if not popped: del self.in_progress_v_dl[media_src]
 
-    def enqueue(self, user_index: UserIndexStore, media_src: str, name: str, models: set[int]):
+    def enqueue(self, user_index: UserIndexStore, url: str, name: str, models: set[int]):
         with self.in_progress_v_lock:
+            params_idx = url.find("?")
+            if params_idx != -1:
+                media_src = url[:params_idx]
+            else:
+                media_src = url
             models = set(filter(lambda m: user_index.get(m, name) is None, models))
             if not models: return
 
@@ -393,7 +425,7 @@ class Indexer:
             models = set(filter(subscribe_to_embedding_filter, models))
             if not models: return
 
-            if media_src in self.failed_media_dl:
+            if url in self.failed_media_dl:
                 user_index.set_state(name, model_index, State.FAILED)
                 return
             
@@ -409,33 +441,7 @@ class Indexer:
                 self.in_progress_v_dl[media_src][model_index].add(destination)
                 user_index.set_state(name, model_index, State.DOWNLOADING)
         #Thread(target=self._download_media, args=(media_src,), daemon=True).start()
-        self.download_executor.submit(self._download_media, media_src)
-
-    def status(self, user_index: UserIndexStore, name: str) -> tuple[set[int], set[int], set[int], set[int], set[int]]:
-        remaining = set(range(len(MODELS)))
-
-        processing = set()
-        downloading = set()
-        missing = set()
-        failed = set()
-        with self.in_progress_v_lock:
-            completed = set(filter(lambda m: user_index.get(m, name) is not None, remaining))
-            remaining -= completed
-            if not remaining:
-                return failed, missing, downloading, processing, completed
-
-            for model_idx in remaining:
-                status = user_index.get_state(name, model_idx)
-                if status == State.PROCESSING:
-                    processing.add(model_idx)
-                elif status == State.DOWNLOADING:
-                    downloading.add(model_idx)
-                elif status == State.FAILED:
-                    failed.add(model_idx)
-                else:
-                    missing.add(model_idx)
-        return failed, missing, downloading, processing, completed
-
+        self.download_executor.submit(self._download_media, url, media_src)
 
     def resize_media(self, data: BytesIO, content_type: str, nframes: int, resolution: tuple[int, int]) -> list[np.ndarray]:
         frames = []
@@ -551,8 +557,7 @@ def status(user_key):
     if not name:
         return error("Missing 'name' parameter"), 400
 
-    user_index = get_user_index(user_key)
-    failed, missing, downloading, processing, completed = indexer.status(user_index, name)
+    failed, missing, downloading, processing, completed = get_user_index(user_key).status(name)
     return jsonify({
         "status": "ok",
         "failed": list(failed),
