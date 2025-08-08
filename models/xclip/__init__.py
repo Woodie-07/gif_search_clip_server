@@ -48,7 +48,7 @@ class XClip(BaseModel):
         processed_videos = torch.cat(processed_videos, 0).float()
 
         model, _ = self.load()
-        print("running model (v)")
+        print("running X-CLIP (v)")
         with torch.no_grad():
             video_features = model.get_video_features(processed_videos).float()
             video_features = video_features / video_features.norm(dim=-1, keepdim=True)
@@ -57,7 +57,7 @@ class XClip(BaseModel):
 
     def process_texts(self, texts: list[str]) -> list[np.ndarray]:
         model, processor = self.load()
-        print("running model (t)")
+        print("running X-CLIP (t)")
         inputs = processor(text=texts, return_tensors="pt", padding=True, truncation=True)
         with torch.no_grad():
             text_features = model.get_text_features(**inputs).float()

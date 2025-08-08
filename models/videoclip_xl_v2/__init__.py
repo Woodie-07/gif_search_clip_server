@@ -58,7 +58,7 @@ class VideoCLIP_XL_v2(BaseModel):
         processed_videos = torch.cat(processed_videos, 0).float()
 
         videoclip_xl = self.load()
-        print("running model (v)")
+        print("running VideoCLIP_XL_v2 (v)")
         with torch.no_grad():
             video_features = videoclip_xl.vision_model.get_vid_features(processed_videos).float()
             video_features = video_features / video_features.norm(dim=-1, keepdim=True)
@@ -67,7 +67,7 @@ class VideoCLIP_XL_v2(BaseModel):
 
     def process_texts(self, texts: list[str]) -> list[np.ndarray]:
         videoclip_xl = self.load()
-        print("running model (t)")
+        print("running VideoCLIP_XL_v2 (t)")
         with torch.no_grad():
             text_inputs = text_encoder.tokenize(texts, truncate=True)
             text_features = videoclip_xl.text_model.encode_text(text_inputs).float()

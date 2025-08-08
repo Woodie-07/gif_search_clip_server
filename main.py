@@ -111,17 +111,22 @@ class Index:
         if os.path.exists(f"indexes/{self.name}.names"):
             os.remove(f"indexes/{self.name}.names")
 
+class ResizeMode(IntEnum):
+    STRETCH = auto()
+    CENTER_CROP = auto()
+
 class Model:
-    def __init__(self, name: str, model: BaseModel, dim: int, res: tuple[int, int], fcount: int):
+    def __init__(self, name: str, model: BaseModel, dim: int, res: tuple[int, int], fcount: int, resize_mode: ResizeMode):
         self.name = name
         self.model = model
         self.dim = dim
         self.res = res
         self.fcount = fcount
+        self.resize_mode = resize_mode
 
 MODELS = [
-    Model("VideoCLIP-XL-v2", VideoCLIP_XL_v2(), 768, (224, 224), 8),
-    Model("X-CLIP", XClip(), 512, (224, 224), 8),
+    Model("VideoCLIP-XL-v2", VideoCLIP_XL_v2(), 768, (224, 224), 8, ResizeMode.STRETCH),
+    Model("X-CLIP", XClip(), 512, (224, 224), 8, ResizeMode.CENTER_CROP),
 ]
 
 class CLIPQueueProcessor:
@@ -375,9 +380,10 @@ class Indexer:
             processed_media = {}
             for model_idx, destinations in required_models.items():
                 model = MODELS[model_idx]
-                req = (model.fcount, model.res)
+                req = (model.fcount, model.res, model.resize_mode)
                 if req not in processed_media:
                     processed = self.resize_media(data, content_type, *req)
+                    data.seek(0)
                     if not processed:
                         return
                     processed_media[req] = processed
@@ -443,7 +449,41 @@ class Indexer:
         #Thread(target=self._download_media, args=(media_src,), daemon=True).start()
         self.download_executor.submit(self._download_media, url, media_src)
 
-    def resize_media(self, data: BytesIO, content_type: str, nframes: int, resolution: tuple[int, int]) -> list[np.ndarray]:
+    def resize_image(self, image: Image.Image, resolution: tuple[int, int], resize_mode: ResizeMode) -> Image.Image:
+        if resize_mode == ResizeMode.STRETCH:
+            return image.resize(resolution)
+        elif resize_mode == ResizeMode.CENTER_CROP:
+            new_width, new_height = image.size
+            new_top = 0
+            new_left = 0
+            if new_width < new_height:
+                new_top = (new_height - new_width) // 2
+                new_height = new_width
+            else:
+                new_left = (new_width - new_height) // 2
+                new_width = new_height
+            return image.resize(resolution, box=(new_left, new_top, new_left + new_width, new_top + new_height))
+        else:
+            raise ValueError("Invalid resize mode")
+
+    def resize_mat_cv2(self, mat: np.ndarray, resolution: tuple[int, int], resize_mode: ResizeMode) -> np.ndarray:
+        if resize_mode == ResizeMode.STRETCH:
+            return cv2.resize(mat, resolution)
+        elif resize_mode == ResizeMode.CENTER_CROP:
+            new_height, new_width = mat.shape[:2]
+            new_top = 0
+            new_left = 0
+            if new_width < new_height:
+                new_top = (new_height - new_width) // 2
+                new_height = new_width
+            else:
+                new_left = (new_width - new_height) // 2
+                new_width = new_height
+            return cv2.resize(mat[new_top:new_top + new_height, new_left:new_left + new_width], resolution)
+        else:
+            raise ValueError("Invalid resize mode")
+
+    def resize_media(self, data: BytesIO, content_type: str, nframes: int, resolution: tuple[int, int], resize_mode: ResizeMode) -> list[np.ndarray]:
         frames = []
         if content_type in ("image/gif", "image/png"):
             image = Image.open(data)
@@ -453,15 +493,15 @@ class Indexer:
                 if image.n_frames < nframes:
                     for i in range(image.n_frames):
                         image.seek(i)
-                        frames.append(np.array(image.convert("RGB").resize(resolution)))
+                        frames.append(np.array(self.resize_image(image.convert("RGB"), resolution, resize_mode)))
                     frames.extend([frames[-1]] * (nframes - len(frames)))
                 else:
                     step = image.n_frames / nframes
                     for i in range(nframes):
                         image.seek(int(i * step))
-                        frames.append(np.array(image.convert("RGB").resize(resolution)))
+                        frames.append(np.array(self.resize_image(image.convert("RGB"), resolution, resize_mode)))
             else:
-                frames = [np.array(image.convert("RGB").resize(resolution))] * nframes
+                frames = [np.array(self.resize_image(image.convert("RGB"), resolution, resize_mode))] * nframes
         else:
             video = cv2.VideoCapture(source=data, apiPreference=cv2.CAP_FFMPEG, params=[])
             total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -472,7 +512,7 @@ class Indexer:
                     ret, frame = video.read()
                     if not ret:
                         break
-                    frames.append(cv2.resize(frame, resolution))
+                    frames.append(self.resize_mat_cv2(frame, resolution, resize_mode))
                 frames.extend([frames[-1]] * (nframes - len(frames)))
             else:
                 step = total_frames / nframes
@@ -481,7 +521,7 @@ class Indexer:
                     ret, frame = video.read()
                     if not ret:
                         break
-                    frames.append(cv2.resize(frame, resolution))
+                    frames.append(self.resize_mat_cv2(frame, resolution, resize_mode))
         return frames
 
 indexer = Indexer()
