@@ -631,5 +631,3 @@ def search(user_key):
         "results": {i: get_user_index(user_key).search(i, np.array([vectors[i]]), k=10)[0] for i in range(len(MODELS))}
         }), 200
 
-
-app.run(host='127.0.0.1', port=5002, debug=False, threaded=False)

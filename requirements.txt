@@ -13,3 +13,4 @@ regex
 discord-protos
 flask-cors
 transformers
+gunicorn

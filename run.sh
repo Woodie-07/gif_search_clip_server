@@ -1,0 +1,1 @@
+gunicorn -b "127.0.0.1:5002" --threads 5 main:app
