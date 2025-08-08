@@ -432,7 +432,8 @@ class Indexer:
             if not models: return
 
             if url in self.failed_media_dl:
-                user_index.set_state(name, model_index, State.FAILED)
+                for model_index in models:
+                    user_index.set_state(name, model_index, State.FAILED)
                 return
             
             downloading = self.in_progress_v_dl.get(media_src)
