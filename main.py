@@ -100,11 +100,13 @@ class Index:
     
     def save(self):
         with self.save_lock:
-            faiss.write_index(self.index, f"indexes/{self.name}.index")
-            with open(f"indexes/{self.name}.names", 'wb') as f:
+            faiss.write_index(self.index, f"indexes/{self.name}.index.writing")
+            with open(f"indexes/{self.name}.names.writing", 'wb') as f:
                 for name in self.names:
                     f.write(struct.pack('H', len(name)))
                     f.write(name.encode('utf-8'))
+            os.replace(f"indexes/{self.name}.index.writing", f"indexes/{self.name}.index")
+            os.replace(f"indexes/{self.name}.names.writing", f"indexes/{self.name}.names")
 
     def clear(self):
         self.index.reset()
