@@ -12,10 +12,15 @@ import cv2
 from collections import defaultdict
 from enum import IntEnum, auto
 from concurrent.futures import ThreadPoolExecutor
+from typing import Callable
+from queue import Queue, Empty
 
 from models.base import BaseModel
 from models.videoclip_xl_v2 import VideoCLIP_XL_v2
 from models.xclip import XClip
+
+MAX_INDEX_QUEUE_SIZE = 50
+MAX_INDEX_BATCH_SIZE = 20
 
 class Index:
     def __init__(self, dim: int, name: str):
@@ -131,30 +136,30 @@ MODELS = [
 
 class CLIPQueueProcessor:
     def __init__(self):
-        self.vqueues: defaultdict[int, list] = defaultdict(list)
-        self.tqueues: defaultdict[int, list] = defaultdict(list)
+        self.vqueues: defaultdict[int, Queue[tuple[Callable[[np.ndarray], None], np.ndarray]]] = defaultdict(lambda: Queue(maxsize=MAX_INDEX_QUEUE_SIZE))
+        self.tqueues: defaultdict[int, Queue[tuple[Callable[[str], None], str]]] = defaultdict(lambda: Queue(maxsize=MAX_INDEX_QUEUE_SIZE))
         self.lock = Lock()
         self.event = Event()
         self.sleeping = True
         self.event.set()
 
-    def _add(self, model_index: int, callback, data, video: bool):
+    def _add(self, model_index: int, callback: Callable, data: np.ndarray | str, video: bool):
         if model_index < 0 or model_index >= len(MODELS):
             raise IndexError("Model index out of range.")
-            
+
+        if video:
+            self.vqueues[model_index].put((callback, data))
+        else:
+            self.tqueues[model_index].put((callback, data))
         with self.lock:
             if self.sleeping:
                 self.event.set()
                 self.sleeping = False
-            if video:
-                self.vqueues[model_index].append((callback, data))
-            else:
-                self.tqueues[model_index].append((callback, data))
 
-    def addv(self, model_index: int, callback, data: np.ndarray):
+    def addv(self, model_index: int, callback: Callable[[np.ndarray], None], data: np.ndarray):
         self._add(model_index, callback, data, video=True)
 
-    def addt(self, model_index: int, callback, data: str):
+    def addt(self, model_index: int, callback: Callable[[str], None], data: str):
         self._add(model_index, callback, data, video=False)
 
     def worker(self, video: bool):
@@ -163,14 +168,18 @@ class CLIPQueueProcessor:
             if self.sleeping:
                 self.event.wait()
             while True:
+                items = []
                 with self.lock:
                     if len(queues) == 0:
                         self.sleeping = True
                         self.event.clear()
                         break
-                    model_index, items = (k := next(iter(queues)), queues.pop(k))
-                    if len(items) > 20:
-                        items, queues[model_index] = items[:20], items[20:]
+                    model_index, queue = (k := next(iter(queues)), queues.pop(k))
+                    for _ in range(MAX_INDEX_BATCH_SIZE):
+                        try:
+                            items.append(queue.get(block=False))
+                        except Empty:
+                            break
 
                 callbacks = []
                 inputs = []
@@ -246,6 +255,15 @@ class UserIndexStore:
                 else:
                     missing.add(model_idx)
         return failed, missing, downloading, processing, completed
+    
+    def remove_not_present(self, media_srcs: set[str]):
+        for model_index in range(len(MODELS)):
+            index = self.indexes[model_index]
+            names_to_remove = [name for name in index.names if not any(media_src == name for media_src in media_srcs)]
+            if names_to_remove:
+                index.remove(names_to_remove)
+                for name in names_to_remove:
+                    self.pending_states.pop((name, model_index), None)
 
 class IndexDestination:
     def __init__(self, name: str, user_index: UserIndexStore):
@@ -400,13 +418,8 @@ class Indexer:
                         destination.user_index.set_state(destination.name, model_idx, State.FAILED if failed else State.PROCESSING)
                 if not popped: del self.in_progress_v_dl[media_src]
 
-    def enqueue(self, user_index: UserIndexStore, url: str, name: str, models: set[int]):
+    def enqueue(self, user_index: UserIndexStore, media_src: str, url: str, name: str, models: set[int]):
         with self.in_progress_v_lock:
-            params_idx = url.find("?")
-            if params_idx != -1:
-                media_src = url[:params_idx]
-            else:
-                media_src = url
             models = set(filter(lambda m: user_index.get(m, name) is None, models))
             if not models: return
 
@@ -584,8 +597,17 @@ def index(user_key):
         if not domain or len(domain) > 256 or (not domain.endswith(".discordapp.net") and not domain == "media.tenor.co"):
             return error(f"Invalid domain in media_src: {item}"), 400
 
-    for i, item in enumerate(media_srcs):
-        indexer.enqueue(user_index, item, names[i], models)
+    all_media_srcs: set[str] = set()
+    for i, url in enumerate(media_srcs):
+        params_idx = url.find("?")
+        if params_idx != -1:
+            media_src = url[:params_idx]
+        else:
+            media_src = url
+        all_media_srcs.add(media_src)
+        indexer.enqueue(user_index, media_src, url, names[i], models)
+
+    user_index.remove_not_present(all_media_srcs)
 
     return jsonify({"status": "ok", "message": "Indexing started"}), 202
 
