@@ -5,15 +5,16 @@ import os
 import numpy as np
 import struct
 import requests
-from threading import Lock, Thread, Event
+from threading import Thread, Lock, Event, Condition
 from io import BytesIO
 from PIL import Image
 import cv2
 from collections import defaultdict
 from enum import IntEnum, auto
 from concurrent.futures import ThreadPoolExecutor
-from typing import Callable
-from queue import Queue, Empty
+from typing import Callable, Generic, TypeVar, Any
+from queue import Queue
+from readerwriterlock import rwlock
 
 from models.base import BaseModel
 from models.videoclip_xl_v2 import VideoCLIP_XL_v2
@@ -49,7 +50,7 @@ class Index:
             self.names: list[str] = []
 
         self.name = name
-        self.save_lock = Lock()
+        self.lock = rwlock.RWLockWrite()
 
     def __contains__(self, name: str) -> bool:
         return name in self.names
@@ -65,18 +66,19 @@ class Index:
         if vectors.ndim != 2 or vectors.shape[1] != self.index.d:
             raise ValueError("Vectors must be a 2D array with shape (n, dim).")
 
-        self.index.add(vectors)
-        self.names.extend(names)
+        with self.lock.gen_wlock():
+            self.index.add(vectors)
+            self.names.extend(names)
         self.save()
 
-    def remove(self, names: list[str]):
-        for name in names:
-            if name not in self.names:
-                continue
-            
-            idx = self.names.index(name)
-            self.index.remove_ids(np.array([idx]))
-            self.names.pop(idx)
+    def remove(self, names: set[str]):
+        with self.lock.gen_wlock():
+            idxes = [self.names.index(name) for name in names if name in self.names]
+            if not idxes: return
+
+            self.index.remove_ids(np.array(idxes))
+            for idx in sorted(idxes, reverse=True):
+                self.names.pop(idx)
 
         self.save()
 
@@ -84,22 +86,28 @@ class Index:
         if vectors.ndim != 2 or vectors.shape[1] != self.index.d:
             raise ValueError("Vectors must be a 2D array with shape (n, dim).")
         
-        distances, indices = self.index.search(vectors, k)
-        results = []
-        for i in range(len(vectors)):
-            result = [(self.names[idx], distances[i][j].item()) for j, idx in enumerate(indices[i]) if idx >= 0]
-            results.append(result)
+        with self.lock.gen_rlock():
+            distances, indices = self.index.search(vectors, k)
+            results = []
+            for i in range(len(vectors)):
+                result = [(self.names[idx], distances[i][j].item()) for j, idx in enumerate(indices[i]) if idx >= 0]
+                results.append(result)
         return results
     
     def get(self, name: str) -> np.ndarray:
-        if name not in self.names:
-            return None
+        with self.lock.gen_rlock():
+            if name not in self.names:
+                return None
         
-        idx = self.names.index(name)
-        return self.index.reconstruct(idx)
+            idx = self.names.index(name)
+            return self.index.reconstruct(idx)
+
+    def is_present(self, name: str) -> bool:
+        with self.lock.gen_rlock():
+            return name in self.names
     
     def save(self):
-        with self.save_lock:
+        with self.lock.gen_rlock():
             faiss.write_index(self.index, f"indexes/{self.name}.index.writing")
             with open(f"indexes/{self.name}.names.writing", 'wb') as f:
                 for name in self.names:
@@ -109,8 +117,9 @@ class Index:
             os.replace(f"indexes/{self.name}.names.writing", f"indexes/{self.name}.names")
 
     def clear(self):
-        self.index.reset()
-        self.names.clear()
+        with self.lock.gen_wlock():
+            self.index.reset()
+            self.names.clear()
 
         if os.path.exists(f"indexes/{self.name}.index"):
             os.remove(f"indexes/{self.name}.index")
@@ -136,65 +145,69 @@ MODELS = [
     Model("X-CLIP", XClip(), 512, (224, 224), 8, ResizeMode.CENTER_CROP),
 ]
 
-class CLIPQueueProcessor:
-    def __init__(self):
-        self.vqueues: defaultdict[int, Queue[tuple[Callable[[np.ndarray], None], np.ndarray]]] = defaultdict(lambda: Queue(maxsize=MAX_INDEX_QUEUE_SIZE))
-        self.tqueues: defaultdict[int, Queue[tuple[Callable[[str], None], str]]] = defaultdict(lambda: Queue(maxsize=MAX_INDEX_QUEUE_SIZE))
-        self.lock = Lock()
-        self.event = Event()
-        self.sleeping = True
-        self.event.set()
+T = TypeVar('T')
+class CLIPQueueProcessor(Generic[T]):
+    class Queue:
+        def __init__(self, model_index):
+            self.model_index = model_index
+            self.q: list[tuple[Callable[[np.ndarray], None], T]] = []
+            self.full_event = Event()
+            self.is_queued = False
+            self.is_queued_lock = Condition()
 
-    def _add(self, model_index: int, callback: Callable, data: np.ndarray | str, video: bool):
+    def __init__(self):
+        self.queues: dict[int, CLIPQueueProcessor.Queue] = {}
+        self.queues_lock = Lock()
+        self.qq: Queue[CLIPQueueProcessor.Queue] = Queue()
+
+    def add(self, model_index: int, callback: Callable[[np.ndarray], None], data: T):
         if model_index < 0 or model_index >= len(MODELS):
             raise IndexError("Model index out of range.")
 
-        if video:
-            self.vqueues[model_index].put((callback, data))
-        else:
-            self.tqueues[model_index].put((callback, data))
-        with self.lock:
-            if self.sleeping:
-                self.event.set()
-                self.sleeping = False
+        with self.queues_lock:
+            if model_index not in self.queues:
+                self.queues[model_index] = CLIPQueueProcessor.Queue(model_index)
+            q = self.queues[model_index]
 
-    def addv(self, model_index: int, callback: Callable[[np.ndarray], None], data: np.ndarray):
-        self._add(model_index, callback, data, video=True)
+        with q.is_queued_lock:
+            while len(q.q) >= MAX_INDEX_QUEUE_SIZE:
+                q.is_queued_lock.wait()
+            q.q.append((callback, data))
+            if not q.is_queued:
+                self.qq.put(q)
+                q.is_queued = True
 
-    def addt(self, model_index: int, callback: Callable[[str], None], data: str):
-        self._add(model_index, callback, data, video=False)
+    def process(self, model: BaseModel, data: T) -> list[np.ndarray]:
+        raise NotImplementedError("This method should be implemented in subclasses.")
 
-    def worker(self, video: bool):
-        queues = self.vqueues if video else self.tqueues
+    def worker(self):
         while True:
-            if self.sleeping:
-                self.event.wait()
-            while True:
-                items = []
-                with self.lock:
-                    if len(queues) == 0:
-                        self.sleeping = True
-                        self.event.clear()
-                        break
-                    model_index, queue = (k := next(iter(queues)), queues.pop(k))
-                    for _ in range(MAX_INDEX_BATCH_SIZE):
-                        try:
-                            items.append(queue.get(block=False))
-                        except Empty:
-                            break
-
-                callbacks = []
-                inputs = []
-                for callback, _input in items:
-                    callbacks.append(callback)
-                    inputs.append(_input)
-
-                if video:
-                    for i, vector in enumerate(MODELS[model_index].model.process_videos(inputs)):
-                        callbacks[i](vector)
+            q = self.qq.get()
+            with q.is_queued_lock:
+                items, remaining = q.q[:MAX_INDEX_BATCH_SIZE], q.q[MAX_INDEX_BATCH_SIZE:]
+                q.q = remaining
+                if remaining:
+                    self.qq.put(q)
                 else:
-                    for i, vector in enumerate(MODELS[model_index].model.process_texts(inputs)):
-                        callbacks[i](vector)
+                    q.is_queued = False
+                q.is_queued_lock.notify_all()
+
+            callbacks = []
+            inputs = []
+            for callback, _input in items:
+                callbacks.append(callback)
+                inputs.append(_input)
+
+            for i, vector in enumerate(MODELS[q.model_index].model.process_videos(inputs)):
+                callbacks[i](vector)
+
+class VCLIPQueueProcessor(CLIPQueueProcessor[np.ndarray]):
+    def process(self, model: BaseModel, data: np.ndarray) -> list[np.ndarray]:
+        return model.process_videos([data])
+    
+class TCLIPQueueProcessor(CLIPQueueProcessor[str]):
+    def process(self, model: BaseModel, data: str) -> list[np.ndarray]:
+        return model.process_texts([data])
 
 class State(IntEnum):
     DOWNLOADING = auto()
@@ -203,16 +216,19 @@ class State(IntEnum):
 
 class UserIndexStore:
     def __init__(self, user_key: str):
-        self.pending_states: dict[tuple[str, int], State] = {}
+        self.pending_states: dict[tuple[str, int], tuple[State, str]] = {}
         self.indexes: list[Index] = []
         for i, model in enumerate(MODELS):
             self.indexes.append(Index(model.dim, f"{user_key}_{i}"))
 
-    def set_state(self, name: str, model_index: int, state: State):
-        self.pending_states[(name, model_index)] = state
+    def set_state(self, name: str, model_index: int, state: State, data: Any = None):
+        self.pending_states[(name, model_index)] = (state, data)
 
-    def get_state(self, name: str, model_index: int) -> State:
-        return self.pending_states.get((name, model_index), None)
+    def del_state(self, name: str, model_index: int):
+        self.pending_states.pop((name, model_index), None)
+
+    def get_state(self, name: str, model_index: int) -> tuple[State, Any]:
+        return self.pending_states.get((name, model_index), (None, None))
 
     def add(self, model_index: int, name: str, vector: np.ndarray):
         if model_index < 0 or model_index >= len(self.indexes):
@@ -240,37 +256,61 @@ class UserIndexStore:
         downloading = set()
         missing = set()
         failed = set()
-        with self.in_progress_v_lock:
-            completed = set(filter(lambda m: self.get(m, name) is not None, remaining))
-            remaining -= completed
-            if not remaining:
-                return failed, missing, downloading, processing, completed
 
-            for model_idx in remaining:
-                status = self.get_state(name, model_idx)
-                if status == State.PROCESSING:
-                    processing.add(model_idx)
-                elif status == State.DOWNLOADING:
-                    downloading.add(model_idx)
-                elif status == State.FAILED:
-                    failed.add(model_idx)
-                else:
-                    missing.add(model_idx)
+        completed = set(filter(lambda m: self.indexes[m].is_present(name), remaining))
+        remaining -= completed
+        if not remaining:
+            return failed, missing, downloading, processing, completed
+
+        for model_idx in remaining:
+            status, _ = self.get_state(name, model_idx)
+            if status == State.PROCESSING:
+                processing.add(model_idx)
+            elif status == State.DOWNLOADING:
+                downloading.add(model_idx)
+            elif status == State.FAILED:
+                failed.add(model_idx)
+            else:
+                missing.add(model_idx)
         return failed, missing, downloading, processing, completed
-    
-    def remove_not_present(self, media_srcs: set[str]):
+
+    def remove(self, names: set[str], model_index: int):
+        if model_index < 0 or model_index >= len(self.indexes):
+            raise IndexError("Model index out of range.")
+        
+        self.indexes[model_index].remove(names)
+        for name in names:
+            self.pending_states.pop((name, model_index), None)
+
+    def remove_not_present(self, names: set[str]):
         for model_index in range(len(MODELS)):
-            index = self.indexes[model_index]
-            names_to_remove = [name for name in index.names if not any(media_src == name for media_src in media_srcs)]
-            if names_to_remove:
-                index.remove(names_to_remove)
-                for name in names_to_remove:
-                    self.pending_states.pop((name, model_index), None)
+            names_indexed_this = set(self.indexes[model_index].names)
+            self.remove(names_indexed_this - names, model_index)
+            for name in names - names_indexed_this:
+                state, data = self.get_state(name, model_index)
+                if state in (State.DOWNLOADING, State.PROCESSING):
+                    target = IndexDestination(name, self)
+                    found: IndexDestination = None
+                    for dest in data:
+                        if dest == target:
+                            found = dest
+                            break
+                    else:
+                        continue
+                    with found.lock:
+                        if found.event.is_set():
+                            self.remove({name}, model_index)
+                            continue
+                        else:
+                            found.event.set()
+                    data.discard(found)
 
 class IndexDestination:
     def __init__(self, name: str, user_index: UserIndexStore):
         self.name = name
         self.user_index = user_index
+        self.lock = Lock()
+        self.event = Event()
 
     def __hash__(self):
         return hash((self.name, id(self.user_index)))
@@ -325,9 +365,10 @@ class Indexer:
 
         self.download_executor = ThreadPoolExecutor(max_workers=5)
 
-        self.clip_queue_processor = CLIPQueueProcessor()
-        Thread(target=self.clip_queue_processor.worker, args=(True,), daemon=True).start()
-        Thread(target=self.clip_queue_processor.worker, args=(False,), daemon=True).start()
+        self.vclip_queue_processor = VCLIPQueueProcessor()
+        self.tclip_queue_processor = TCLIPQueueProcessor()
+        Thread(target=self.vclip_queue_processor.worker, daemon=True).start()
+        Thread(target=self.tclip_queue_processor.worker, daemon=True).start()
 
     def tclip_complete_callback(self, job: TJob, vector: np.ndarray):
         with self.in_progress_t_lock:
@@ -354,7 +395,7 @@ class Indexer:
 
                 job = Indexer.TJob(model_idx, text)
                 self.in_progress_t[(model_idx, text)] = job
-                self.clip_queue_processor.addt(model_idx, lambda vec, job=job: self.tclip_complete_callback(job, vec), text)
+                self.tclip_queue_processor.add(model_idx, lambda vec, job=job: self.tclip_complete_callback(job, vec), text)
                 vectors[i] = job
         
         if len(has_vector_idxes) != len(models):
@@ -371,7 +412,11 @@ class Indexer:
             del self.in_progress_v[(model_index, job.media_src)]
             self.global_v_index.add(model_index, job.media_src, vector)
             for destination in job.destinations:
-                destination.user_index.add(model_index, destination.name, vector)
+                with destination.lock:
+                    if destination.event.is_set():
+                        continue
+                    destination.user_index.add(model_index, destination.name, vector)
+                    destination.event.set()
 
     def _download_media(self, url: str, media_src: str):
         failed = True
@@ -410,14 +455,14 @@ class Indexer:
                 job = Indexer.VJob(model_idx, media_src, destinations)
                 with self.in_progress_v_lock:
                     self.in_progress_v[(model_idx, media_src)] = job
-                self.clip_queue_processor.addv(model_idx, lambda vector, job=job, model_idx=model_idx: self.vclip_complete_callback(job, model_idx, vector), processed_media[req])
+                self.vclip_queue_processor.add(model_idx, lambda vector, job=job, model_idx=model_idx: self.vclip_complete_callback(job, model_idx, vector), processed_media[req])
             failed = False
         finally:
             with self.in_progress_v_lock:
                 if failed: self.failed_media_dl.add(url)
                 for model_idx, destinations in required_models.items():
                     for destination in destinations:
-                        destination.user_index.set_state(destination.name, model_idx, State.FAILED if failed else State.PROCESSING)
+                        destination.user_index.set_state(destination.name, model_idx, State.FAILED if failed else State.PROCESSING, destinations)
                 if not popped: del self.in_progress_v_dl[media_src]
 
     def enqueue(self, user_index: UserIndexStore, media_src: str, url: str, name: str, models: set[int]):
@@ -441,7 +486,7 @@ class Indexer:
                 if vjob is None:
                     return True
                 vjob.destinations.add(destination)
-                user_index.set_state(name, model_index, State.PROCESSING)
+                user_index.set_state(name, model_index, State.PROCESSING, vjob.destinations)
                 return False
             models = set(filter(subscribe_to_embedding_filter, models))
             if not models: return
@@ -455,13 +500,13 @@ class Indexer:
             if downloading is not None:
                 for model_index in models:
                     downloading[model_index].add(destination)
-                    user_index.set_state(name, model_index, State.DOWNLOADING)
+                    user_index.set_state(name, model_index, State.DOWNLOADING, downloading[model_index])
                 return
             
             self.in_progress_v_dl[media_src] = defaultdict(set)
             for model_index in models:
                 self.in_progress_v_dl[media_src][model_index].add(destination)
-                user_index.set_state(name, model_index, State.DOWNLOADING)
+                user_index.set_state(name, model_index, State.DOWNLOADING, self.in_progress_v_dl[media_src][model_index])
         #Thread(target=self._download_media, args=(media_src,), daemon=True).start()
         self.download_executor.submit(self._download_media, url, media_src)
 
@@ -599,17 +644,15 @@ def index(user_key):
         if not domain or len(domain) > 256 or (not domain.endswith(".discordapp.net") and not domain == "media.tenor.co"):
             return error(f"Invalid domain in media_src: {item}"), 400
 
-    all_media_srcs: set[str] = set()
     for i, url in enumerate(media_srcs):
         params_idx = url.find("?")
         if params_idx != -1:
             media_src = url[:params_idx]
         else:
             media_src = url
-        all_media_srcs.add(media_src)
         indexer.enqueue(user_index, media_src, url, names[i], models)
 
-    user_index.remove_not_present(all_media_srcs)
+    user_index.remove_not_present(set(names))
 
     return jsonify({"status": "ok", "message": "Indexing started"}), 202
 
@@ -654,4 +697,3 @@ def search(user_key):
         "status": "ok",
         "results": {i: get_user_index(user_key).search(i, np.array([vectors[i]]), k=10)[0] for i in range(len(MODELS))}
         }), 200
-
