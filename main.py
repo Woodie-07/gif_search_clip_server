@@ -286,7 +286,7 @@ class UserIndexStore:
         for model_index in range(len(MODELS)):
             names_indexed_this = set(self.indexes[model_index].names)
             self.remove(names_indexed_this - names, model_index)
-            for name in names - names_indexed_this:
+            for name in set([name for name, model_idx in self.pending_states if model_idx == model_index]) - names:
                 state, data = self.get_state(name, model_index)
                 if state in (State.DOWNLOADING, State.PROCESSING):
                     target = IndexDestination(name, self)
