@@ -198,16 +198,16 @@ class CLIPQueueProcessor(Generic[T]):
                 callbacks.append(callback)
                 inputs.append(_input)
 
-            for i, vector in enumerate(MODELS[q.model_index].model.process_videos(inputs)):
+            for i, vector in enumerate(self.process(MODELS[q.model_index].model, inputs)):
                 callbacks[i](vector)
 
 class VCLIPQueueProcessor(CLIPQueueProcessor[np.ndarray]):
-    def process(self, model: BaseModel, data: np.ndarray) -> list[np.ndarray]:
-        return model.process_videos([data])
-    
+    def process(self, model: BaseModel, data: list[np.ndarray]) -> list[np.ndarray]:
+        return model.process_videos(data)
+
 class TCLIPQueueProcessor(CLIPQueueProcessor[str]):
-    def process(self, model: BaseModel, data: str) -> list[np.ndarray]:
-        return model.process_texts([data])
+    def process(self, model: BaseModel, data: list[str]) -> list[np.ndarray]:
+        return model.process_texts(data)
 
 class State(IntEnum):
     DOWNLOADING = auto()
