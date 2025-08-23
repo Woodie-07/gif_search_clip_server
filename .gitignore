@@ -3,3 +3,4 @@ indexes/
 .venv/
 __pycache__/
 models/videoclip_xl_v2/VideoCLIP-XL-v2.bin
+cc-webvid2m-4f_stformer_b_16_224.pth.tar
