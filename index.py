@@ -121,6 +121,7 @@ class UserIndexStore:
     def __init__(self, user_key: str):
         self.pending_states: dict[tuple[str, int], tuple[State, str]] = {}
         self.indexes: list[Index] = []
+        self.user_key = user_key
         for i, model in enumerate(MODELS):
             self.indexes.append(Index(model.dim, f"{user_key}_{i}"))
 

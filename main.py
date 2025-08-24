@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 import numpy as np
 import requests
@@ -11,7 +11,8 @@ from models import MODELS
 from index import UserIndexStore, IndexDestination, State
 from queue_workers import VCLIPQueueProcessor, TCLIPQueueProcessor
 from resize import resize_media
-import json
+
+STATS_ALLOWED_IP = "127.0.0.1"
 
 user_indexes = {}
 
@@ -44,6 +45,10 @@ class Indexer:
             self.lock = Lock()
             self.event = Event()
             self.output = None
+            self.users: set[str] = set()
+
+        def add_user(self, user_key: str):
+            self.users.add(user_key)
 
     def __init__(self):
         self.in_progress_v_lock = Lock()
@@ -72,7 +77,7 @@ class Indexer:
         job.output = vector
         job.event.set()
 
-    def get_text_vectors(self, models: list[int], text: str):
+    def get_text_vectors(self, models: list[int], text: str, user_key: str):
         vectors: (list[Indexer.TJob] | list[np.ndarray]) = [None] * len(models)
         has_vector_idxes = set()
         with self.in_progress_t_lock:
@@ -89,6 +94,7 @@ class Indexer:
                     continue
 
                 job = Indexer.TJob(model_idx, text)
+                job.add_user(user_key)
                 self.in_progress_t[(model_idx, text)] = job
                 self.tclip_queue_processor.add(model_idx, lambda vec, job=job: self.tclip_complete_callback(job, vec), text)
                 vectors[i] = job
@@ -304,7 +310,7 @@ def search(user_key):
     if not text:
         return error("Missing 'text' parameter"), 400
     
-    res = indexer.get_text_vectors(list(range(len(MODELS))), text)
+    res = indexer.get_text_vectors(list(range(len(MODELS))), text, user_key)
     vectors = []
     if isinstance(res[0], Indexer.TJob):
         for i in range(len(MODELS)):
@@ -317,5 +323,47 @@ def search(user_key):
         "status": "ok",
         "results": {i: get_user_index(user_key).search(i, np.array([vectors[i]]), k=10)[0] for i in range(len(MODELS))}
         }), 200
+
+@app.route('/metrics', methods=['GET'])
+def metrics():
+    ip = request.remote_addr
+    if ip != STATS_ALLOWED_IP:
+        return "disallowed"
+    
+    stats = ""
+    stats += f"loaded_user_indexes {len(user_indexes)}\n"
+    stats += f"failed_media_dl {len(indexer.failed_media_dl)}\n"
+
+    for i, index in enumerate(indexer.global_v_index.indexes):
+        stats += "indexed_videos{model_idx=\"" + str(i) + "\"} " + str(len(index.names)) + "\n"
+    for i, index in enumerate(indexer.global_t_index.indexes):
+        stats += "indexed_text{model_idx=\"" + str(i) + "\"} " + str(len(index.names)) + "\n"
+
+    stats += f"in_progress_text {len(indexer.in_progress_t)}\n"
+    stats += f"in_progress_video_downloads {len(indexer.in_progress_v_dl)}\n"
+    stats += f"in_progress_video_clip {len(indexer.in_progress_v)}\n"
+
+    per_user_text = defaultdict(int)
+    for tjob in indexer.in_progress_t.values():
+        for user_key in tjob.users:
+            per_user_text[user_key] += 1
+    for user_key, count in per_user_text.items():
+        stats += "in_progress_text_per_user{user_key=\"" + user_key + "\"} " + str(count) + "\n"
+    
+    per_user_v_dl = defaultdict(int)
+    for models in indexer.in_progress_v_dl.values():
+        for user_key in {index_dest.user_index.user_key for index_dests in models.values() for index_dest in index_dests}:
+            per_user_v_dl[user_key] += 1
+    for user_key, count in per_user_v_dl.items():
+        stats += "in_progress_video_downloads_per_user{user_key=\"" + user_key + "\"} " + str(count) + "\n"
+
+    per_user_v = defaultdict(int)
+    for vjob in indexer.in_progress_v.values():
+        for user_key in {index_dest.user_index.user_key for index_dest in vjob.destinations}:
+            per_user_v[user_key] += 1
+    for user_key, count in per_user_v.items():
+        stats += "in_progress_video_clip_per_user{user_key=\"" + user_key + "\"} " + str(count) + "\n"
+
+    return Response(stats, mimetype="text/plain")
 
 app.run(host='127.0.0.1', port=5002, debug=False, threaded=True)
