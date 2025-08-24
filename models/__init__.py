@@ -4,6 +4,7 @@ from models.videoclip_xl_v2 import VideoCLIP_XL_v2
 from models.xclip import XClip
 from models.frozen_in_time import FrozenInTime
 
+# defines requirements and class for each model
 class Model:
     def __init__(self, name: str, model: BaseModel, dim: int, res: tuple[int, int], fcount: int, resize_mode: ResizeMode):
         self.name = name

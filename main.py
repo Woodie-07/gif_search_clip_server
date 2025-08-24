@@ -12,7 +12,7 @@ from index import UserIndexStore, IndexDestination, State
 from queue_workers import VCLIPQueueProcessor, TCLIPQueueProcessor
 from resize import resize_media
 
-STATS_ALLOWED_IP = "127.0.0.1"
+STATS_ALLOWED_IP = "127.0.0.1" # IP address allowed to fetch /metrics
 
 user_indexes = {}
 
@@ -31,13 +31,17 @@ def is_valid_user_key(user_key: str) -> bool:
 
 class Indexer:
 
+    # in progress video CLIP job
     class VJob:
         def __init__(self, model_index: int, media_src: str, destinations: set[IndexDestination]):
             self.model_index = model_index
             self.media_src = media_src
+
+            # if another user tries to index the same gif, their index will be added here to 'subscribe' to the result
             self.destinations = destinations
             self.lock = Lock()
 
+    # in progress text CLIP job
     class TJob:
         def __init__(self, model_index: int, text: str):
             self.model_index = model_index
@@ -52,47 +56,63 @@ class Indexer:
 
     def __init__(self):
         self.in_progress_v_lock = Lock()
+        # stores (model_idx, media_src) -> job mappings
         self.in_progress_v: dict[tuple[int, str], Indexer.VJob] = {}
+        # stores media_src -> (model_idx, destinations)s mappings 
         self.in_progress_v_dl: dict[str, defaultdict[int, set[IndexDestination]]] = {}
 
         self.in_progress_t_lock = Lock()
+        # stores (model_idx, text) -> job mappings
         self.in_progress_t: dict[tuple[int, str], Indexer.TJob] = {}
 
+        # whenever anything is indexed by CLIP, a copy is forever stored in the global index
+        # then it can be accessed quickly by any user, no reprocessing required
         self.global_v_index = UserIndexStore("global_v")
         self.global_t_index = UserIndexStore("global_t")
 
+        # URLs that couldn't be downloaded or preprocessed, these will be ignored
+        # preprocessing is decoding the media into raw frames of the desired resolution and count
+        # currently is not saved to disk
         self.failed_media_dl = set()
 
+        # workers that perform downloading and preprocessing
         self.download_executor = ThreadPoolExecutor(max_workers=5)
 
+        # workers that run the CLIP models
+        # each worker will cycle through the required models, processing a batch of videos/texts
         self.vclip_queue_processor = VCLIPQueueProcessor()
         self.tclip_queue_processor = TCLIPQueueProcessor()
         Thread(target=self.vclip_queue_processor.worker, daemon=True).start()
         Thread(target=self.tclip_queue_processor.worker, daemon=True).start()
 
     def tclip_complete_callback(self, job: TJob, vector: np.ndarray):
+        # CLIP has completed on a string. move it out of in progress and into the global index
         with self.in_progress_t_lock:
             del self.in_progress_t[(job.model_index, job.text)]
             self.global_t_index.add(job.model_index, job.text, vector)
+        # write the CLIP vector to the job's output and set the event to wake waiting users
         job.output = vector
         job.event.set()
 
-    def get_text_vectors(self, models: list[int], text: str, user_key: str):
-        vectors: (list[Indexer.TJob] | list[np.ndarray]) = [None] * len(models)
+    def get_text_vectors(self, models: list[int], text: str, user_key: str) -> list[TJob] | list[np.ndarray]:
+        vectors: list[Indexer.TJob] | list[np.ndarray] = [None] * len(models)
         has_vector_idxes = set()
         with self.in_progress_t_lock:
             for i, model_idx in enumerate(models):
                 ret = self.in_progress_t.get((model_idx, text))
                 if ret is not None:
+                    # if this text and model is already in progress, put the job in vectors so caller can 'subscribe' to it
                     vectors[i] = ret
                     continue
 
                 vec = self.global_t_index.get(model_idx, text)
                 if vec is not None:
+                    # if this text and model is already indexed, put the existing vector in vectors
                     vectors[i] = vec
                     has_vector_idxes.add(i)
                     continue
 
+                # make a new job and queue it
                 job = Indexer.TJob(model_idx, text)
                 job.add_user(user_key)
                 self.in_progress_t[(model_idx, text)] = job
@@ -100,6 +120,8 @@ class Indexer:
                 vectors[i] = job
         
         if len(has_vector_idxes) != len(models):
+            # if we don't already have all vectors, convert known vectors into pseudo-jobs
+            # this way the function returns either all jobs or all vectors
             for i in has_vector_idxes:
                 job = Indexer.TJob(models[i], text)
                 job.output = vectors[i]
@@ -109,11 +131,16 @@ class Indexer:
         return vectors
 
     def vclip_complete_callback(self, job: VJob, model_index: int, vector: np.ndarray):
+        # CLIP completed on a video, add to global index and all subscribed user indexes
         with self.in_progress_v_lock:
             del self.in_progress_v[(model_index, job.media_src)]
             self.global_v_index.add(model_index, job.media_src, vector)
             for destination in job.destinations:
                 with destination.lock:
+                    # used for cancellation
+                    # if a user removed the GIF while it's processing, the cancel function will wait on the lock
+                    # once the lock is acquired, it checks this event. if set, it knows it's too late and must remove from the user's index
+                    # if not set, it sets it, preventing the vector from being added to the user's index at all
                     if destination.event.is_set():
                         continue
                     destination.user_index.add(model_index, destination.name, vector)
@@ -124,23 +151,27 @@ class Indexer:
         required_models = self.in_progress_v_dl[media_src]
         popped = False
         try:
+            # stream so we don't download huge media before we know what the size is
             r = requests.get(url, stream=True)
             if "content-length" not in r.headers or "content-type" not in r.headers:
                 return
 
-            if int(r.headers["content-length"]) > 50 * 1024 * 1024:
+            if int(r.headers["content-length"]) > 50 * 1024 * 1024: # ignore over 50 MB
                 return
 
             content_type = r.headers["content-type"]
-            if content_type not in ("image/gif", "image/png", "video/mp4"):
+            if content_type not in ("image/gif", "image/png", "video/mp4"): # ignore unknown file types
                 return
             
             data = BytesIO(r.content)
 
-            del r
+            # we just moved the content into a BytesIO, r can be deleted to save a little memory
+            del r 
 
             jobs = []
             with self.in_progress_v_lock:
+                # download complete, let's remove from in progress dl and create per-model jobs
+                # prevents new model indexes from being added to this download job as we're about to process those
                 del self.in_progress_v_dl[media_src]
                 popped = True
                 for model_idx, destinations in required_models.items():
@@ -150,6 +181,7 @@ class Indexer:
 
             processed_media = {}
             for i, (model_idx, destinations) in enumerate(required_models.items()):
+                # get the media requirements for this model and preprocess to match them, if not already done
                 model = MODELS[model_idx]
                 req = (model.fcount, model.res, model.resize_mode)
                 if req not in processed_media:
@@ -159,21 +191,30 @@ class Indexer:
                         return
                     processed_media[req] = processed
                 job = jobs[i]
+                # queue video CLIP job! runs the lambda when it's done.
                 self.vclip_queue_processor.add(model_idx, lambda vector, job=job, model_idx=model_idx: self.vclip_complete_callback(job, model_idx, vector), processed_media[req])
             failed = False
         finally:
             with self.in_progress_v_lock:
+                # if something went wrong during download/preprocess, mark this media as failed
+                # it's entirely possible that it failed because the Discord rotating CDN args are now invalid because we took too long if long backlog
+                # that's why we don't mark media_src (URL with stripped params) as bad, rather the full URL
                 if failed: self.failed_media_dl.add(url)
                 for model_idx, destinations in required_models.items():
                     for destination in destinations:
+                        # update user statuses
                         destination.user_index.set_state(destination.name, model_idx, State.FAILED if failed else State.PROCESSING, destinations)
+                # if we failed before deleting, do it now
                 if not popped: del self.in_progress_v_dl[media_src]
 
     def enqueue(self, user_index: UserIndexStore, media_src: str, url: str, name: str, models: set[int]):
+        # we need to find what stage the media is in so we can subscribe to the pending result if already queued
+        # therefore, we acquire the lock so the media won't move between stages as we're looking for it so we miss it
         with self.in_progress_v_lock:
             models = set(filter(lambda m: user_index.get(m, name) is None, models))
             if not models: return
 
+            # is in global? copy to user
             def from_global_filter(model_index: int) -> bool:
                 res = self.global_v_index.get(model_index, media_src)
                 if res is not None:
@@ -183,6 +224,7 @@ class Indexer:
             models = set(filter(from_global_filter, models))
             if not models: return
 
+            # is CLIP in progress? subscribe to it
             def subscribe_to_embedding_filter(model_index: int) -> bool:
                 vjob = self.in_progress_v.get((model_index, media_src))
                 if vjob is None:
@@ -193,11 +235,13 @@ class Indexer:
             models = set(filter(subscribe_to_embedding_filter, models))
             if not models: return
 
+            # is failed? mark as failed and ignore
             if url in self.failed_media_dl:
                 for model_index in models:
                     user_index.set_state(name, model_index, State.FAILED)
                 return
             
+            # is downloading? subscribe to it
             downloading = self.in_progress_v_dl.get(media_src)
             if downloading is not None:
                 for model_index in models:
@@ -205,6 +249,7 @@ class Indexer:
                     user_index.set_state(name, model_index, State.DOWNLOADING, downloading[model_index])
                 return
             
+            # it's had no prior indexing attempt. begin indexing
             self.in_progress_v_dl[media_src] = defaultdict(set)
             for model_index in models:
                 self.in_progress_v_dl[media_src][model_index].add(IndexDestination(name, user_index))
@@ -243,8 +288,8 @@ def index(user_key):
     for name in names:
         if not isinstance(name, str) or not name.strip():
             return error("Each name must be a non-empty string"), 400
-        if len(name) > 512:
-            return error("Each name must not exceed 512 characters"), 400
+        if len(name) > 2048:
+            return error("Each name must not exceed 2048 characters"), 400
 
     media_srcs: list[str] = payload["media_srcs"]
     if not isinstance(media_srcs, list) or len(media_srcs) != len(names):
@@ -271,6 +316,8 @@ def index(user_key):
             return error(f"Invalid domain in media_src: {item}"), 400
 
     for i, url in enumerate(media_srcs):
+        # strip url params from url to make media_src
+        # this way we don't treat different Discord CDN params as a different image
         params_idx = url.find("?")
         if params_idx != -1:
             media_src = url[:params_idx]
@@ -278,6 +325,8 @@ def index(user_key):
             media_src = url
         indexer.enqueue(user_index, media_src, url, names[i], models)
 
+    # remove any GIFs in the user index (or pending) that aren't in this index request
+    # therefore we delete GIFs that the user unfavourites
     user_index.remove_not_present(set(names))
 
     return jsonify({"status": "ok", "message": "Indexing started"}), 202
@@ -291,6 +340,7 @@ def status(user_key):
     if not name:
         return error("Missing 'name' parameter"), 400
 
+    # get the status of each model index for a given GIF
     failed, missing, downloading, processing, completed = get_user_index(user_key).status(name)
     return jsonify({
         "status": "ok",
@@ -310,6 +360,9 @@ def search(user_key):
     if not text:
         return error("Missing 'text' parameter"), 400
     
+    # this function either returns all TJobs or all vectors
+    # if TJobs, wait for each event and fetch output, else use the vectors directly
+    # currently we run the text through all models, not just user-selected ones
     res = indexer.get_text_vectors(list(range(len(MODELS))), text, user_key)
     vectors = []
     if isinstance(res[0], Indexer.TJob):
@@ -319,11 +372,13 @@ def search(user_key):
     else:
         vectors = res
 
+    # return top 10 results for each model
     return jsonify({
         "status": "ok",
         "results": {i: get_user_index(user_key).search(i, np.array([vectors[i]]), k=10)[0] for i in range(len(MODELS))}
         }), 200
 
+# prometheus format metrics
 @app.route('/metrics', methods=['GET'])
 def metrics():
     ip = request.remote_addr
@@ -365,5 +420,3 @@ def metrics():
         stats += "in_progress_video_clip_per_user{user_key=\"" + user_key + "\"} " + str(count) + "\n"
 
     return Response(stats, mimetype="text/plain")
-
-app.run(host='127.0.0.1', port=5002, debug=False, threaded=True)

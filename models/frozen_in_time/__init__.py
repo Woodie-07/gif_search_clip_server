@@ -559,7 +559,7 @@ class FrozenInTime(BaseModel):
                                 "input": "text"
                             },
                     projection="minimal",
-                    load_checkpoint="cc-webvid2m-4f_stformer_b_16_224.pth.tar")
+                    load_checkpoint="models/frozen_in_time/cc-webvid2m-4f_stformer_b_16_224.pth.tar")
                 self.model.eval()
             return self.model, self.tokeniser
 

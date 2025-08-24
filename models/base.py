@@ -2,6 +2,7 @@ from abc import ABC
 import numpy as np
 import torch.nn as nn
 
+# template for model classes
 class BaseModel(ABC):
     def __init__(self):
         pass
