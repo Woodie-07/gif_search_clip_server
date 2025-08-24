@@ -133,12 +133,17 @@ class Indexer:
 
             del r
 
+            jobs = []
             with self.in_progress_v_lock:
                 del self.in_progress_v_dl[media_src]
                 popped = True
+                for model_idx, destinations in required_models.items():
+                    job = Indexer.VJob(model_idx, media_src, destinations)
+                    self.in_progress_v[(model_idx, media_src)] = job
+                    jobs.append(job)
 
             processed_media = {}
-            for model_idx, destinations in required_models.items():
+            for i, (model_idx, destinations) in enumerate(required_models.items()):
                 model = MODELS[model_idx]
                 req = (model.fcount, model.res, model.resize_mode)
                 if req not in processed_media:
@@ -147,9 +152,7 @@ class Indexer:
                     if not processed:
                         return
                     processed_media[req] = processed
-                job = Indexer.VJob(model_idx, media_src, destinations)
-                with self.in_progress_v_lock:
-                    self.in_progress_v[(model_idx, media_src)] = job
+                job = jobs[i]
                 self.vclip_queue_processor.add(model_idx, lambda vector, job=job, model_idx=model_idx: self.vclip_complete_callback(job, model_idx, vector), processed_media[req])
             failed = False
         finally:
@@ -174,13 +177,11 @@ class Indexer:
             models = set(filter(from_global_filter, models))
             if not models: return
 
-            destination = IndexDestination(name, user_index)
-
             def subscribe_to_embedding_filter(model_index: int) -> bool:
                 vjob = self.in_progress_v.get((model_index, media_src))
                 if vjob is None:
                     return True
-                vjob.destinations.add(destination)
+                vjob.destinations.add(IndexDestination(name, user_index))
                 user_index.set_state(name, model_index, State.PROCESSING, vjob.destinations)
                 return False
             models = set(filter(subscribe_to_embedding_filter, models))
@@ -194,13 +195,13 @@ class Indexer:
             downloading = self.in_progress_v_dl.get(media_src)
             if downloading is not None:
                 for model_index in models:
-                    downloading[model_index].add(destination)
+                    downloading[model_index].add(IndexDestination(name, user_index))
                     user_index.set_state(name, model_index, State.DOWNLOADING, downloading[model_index])
                 return
             
             self.in_progress_v_dl[media_src] = defaultdict(set)
             for model_index in models:
-                self.in_progress_v_dl[media_src][model_index].add(destination)
+                self.in_progress_v_dl[media_src][model_index].add(IndexDestination(name, user_index))
                 user_index.set_state(name, model_index, State.DOWNLOADING, self.in_progress_v_dl[media_src][model_index])
         self.download_executor.submit(self._download_media, url, media_src)
 
