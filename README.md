@@ -1,6 +1,8 @@
 # CLIP search server
 This is a Flask API server using video CLIP models to index images/GIFs/MP4s and provide search functionality, intended for CLIP-powered Discord favourited GIF search.
 
+[Stats for my hosted instance](https://stats.woodie.dev/public-dashboards/b616106008c7484eacfb869eccf7b2f6)
+
 ## Features
 - Can download media, process them through CLIP models, and index them in per-user FAISS indexes
 - Multiple models supported, easy to add more
