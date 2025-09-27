@@ -1,7 +1,7 @@
 from typing import Callable, Generic, TypeVar, Any
 import numpy as np
 from threading import Event, Lock, Condition
-from queue import Queue
+from queue import Queue, Empty
 from models import BaseModel, MODELS
 
 MAX_INDEX_QUEUE_SIZE = 50 # maximum length for each model's processing queue
@@ -19,12 +19,13 @@ class CLIPQueueProcessor(Generic[T]):
             self.is_queued = False
             self.is_queued_lock = Condition()
 
-    def __init__(self):
+    def __init__(self, max_queue_size: int = None):
+        self.max_queue_size: int = max_queue_size
         self.queues: dict[int, CLIPQueueProcessor.Queue] = {}
         self.queues_lock = Lock()
         self.qq: Queue[CLIPQueueProcessor.Queue] = Queue() # queue of queues!
 
-    def add(self, model_index: int, callback: Callable[[np.ndarray], None], data: T):
+    def add(self, model_index: int, data: T, callback: Callable[[np.ndarray], None]):
         if model_index < 0 or model_index >= len(MODELS):
             raise IndexError("Model index out of range.")
 
@@ -35,12 +36,23 @@ class CLIPQueueProcessor(Generic[T]):
             q = self.queues[model_index]
 
         with q.is_queued_lock:
-            while len(q.q) >= MAX_INDEX_QUEUE_SIZE:
-                q.is_queued_lock.wait() # this releases the lock until awoken by notify(_all)
+            if self.max_queue_size is not None:
+                while len(q.q) >= self.max_queue_size:
+                    q.is_queued_lock.wait() # this releases the lock until awoken by notify(_all)
             q.q.append((callback, data)) # add our item to the queue
             if not q.is_queued: # if this per-model queue was removed from the main queue (happens when empty), add it
                 self.qq.put(q)
                 q.is_queued = True
+
+    def clear(self):
+        while not self.qq.empty():
+            try:
+                q = self.qq.get(block=False)
+            except Empty:
+                return
+            with q.is_queued_lock:
+                q.q.clear()
+                q.is_queued = False
 
     def process(self, model: BaseModel, data: list[T]) -> list[np.ndarray]:
         raise NotImplementedError("This method should be implemented in subclasses.")
@@ -69,6 +81,9 @@ class CLIPQueueProcessor(Generic[T]):
                 callbacks[i](vector) # run each callback
 
 class VCLIPQueueProcessor(CLIPQueueProcessor[np.ndarray]):
+    def __init__(self):
+        super().__init__(MAX_INDEX_QUEUE_SIZE)
+
     def process(self, model: BaseModel, data: list[np.ndarray]) -> list[np.ndarray]:
         return model.process_videos(data)
 

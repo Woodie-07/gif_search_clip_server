@@ -18,6 +18,8 @@ import sys
 from . import parse_config
 sys.modules['parse_config'] = parse_config
 
+device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+
 class NNBaseModel(nn.Module):
     """
     Base class for all models
@@ -448,14 +450,11 @@ class FrozenInTimeM(NNBaseModel):
         self.vid_proj = vid_proj
 
         if load_checkpoint not in ["", None]:
-            checkpoint = torch.load(load_checkpoint, map_location=torch.device('cpu'), weights_only=False)
+            checkpoint = torch.load(load_checkpoint, map_location=device, weights_only=False)
             state_dict = checkpoint['state_dict']
             new_state_dict = state_dict_data_parallel_fix(state_dict, self.state_dict())
             new_state_dict = self._inflate_positional_embeds(new_state_dict)
             self.load_state_dict(new_state_dict, strict=True)
-
-    def set_device(self, device):
-        self.device = device
 
     def forward(self, data, return_embeds=True):
 
@@ -559,7 +558,7 @@ class FrozenInTime(BaseModel):
                                 "input": "text"
                             },
                     projection="minimal",
-                    load_checkpoint="models/frozen_in_time/cc-webvid2m-4f_stformer_b_16_224.pth.tar")
+                    load_checkpoint="models/frozen_in_time/cc-webvid2m-4f_stformer_b_16_224.pth.tar").to(device)
                 self.model.eval()
             return self.model, self.tokeniser
 
@@ -584,7 +583,7 @@ class FrozenInTime(BaseModel):
             vid_tube = np.transpose(vid_tube, (0, 1, 4, 2, 3))  # (1, fnum, 3, 224, 224)
             vid_tube = torch.from_numpy(vid_tube / 255)
             processed_videos.append(vid_tube)
-        processed_videos = torch.cat(processed_videos, 0).float()
+        processed_videos = torch.cat(processed_videos, 0).float().to(device)
 
         model, _ = self.load()
         print("running Frozen-in-Time (v)")
@@ -592,15 +591,15 @@ class FrozenInTime(BaseModel):
             video_features = model.compute_video(processed_videos).float()
             video_features = video_features / video_features.norm(dim=-1, keepdim=True)
 
-        return video_features.numpy().tolist()
+        return video_features.cpu().numpy().tolist()
 
     def process_texts(self, texts: list[str]) -> list[np.ndarray]:
         model, tokeniser = self.load()
         print("running Frozen-in-Time (t)")
-        inputs = tokeniser(text=texts, return_tensors="pt", padding=True, truncation=True)
+        inputs = tokeniser(text=texts, return_tensors="pt", padding=True, truncation=True).to(device)
         with torch.no_grad():
             text_features = model.compute_text(inputs).float()
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
-        return text_features.numpy()
+        return text_features.cpu().numpy()
 

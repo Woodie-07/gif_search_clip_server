@@ -5,6 +5,8 @@ import numpy as np
 import torch
 from PIL import Image
 
+device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+
 def normalize(data):
     v_mean = np.array([0.485, 0.456, 0.406]).reshape(1,1,3)
     v_std = np.array([0.229, 0.224, 0.225]).reshape(1,1,3)
@@ -20,7 +22,7 @@ class XClip(BaseModel):
         with self.lock:
             if self.model is None:
                 print("loading X-CLIP")
-                self.model = XCLIPModel.from_pretrained("microsoft/xclip-large-patch14-kinetics-600")
+                self.model = XCLIPModel.from_pretrained("microsoft/xclip-large-patch14-kinetics-600").to(device)
                 self.processor = XCLIPProcessor.from_pretrained("microsoft/xclip-large-patch14-kinetics-600")
                 self.model.eval()
             return self.model, self.processor
@@ -34,36 +36,21 @@ class XClip(BaseModel):
 
     def process_videos(self, videos: list[list[np.ndarray]]) -> list[np.ndarray]:
         print(f"X-CLIP processing {len(videos)} videos")
-        """processed_videos = []
-        for vid in videos:
-            for i in range(len(vid)):
-                Image.fromarray(vid[i]).save(f"temp_frame_{i}.jpg")
-            vid_tube = []
-            for fr in vid:
-                fr = fr[:, :, ::-1]  # BGR to RGB
-                fr = np.expand_dims(normalize(fr), axis=(0, 1))  # (1,1,224,224,3)
-                vid_tube.append(fr)
-
-            vid_tube = np.concatenate(vid_tube, axis=1)  # (1, fnum, 224, 224, 3)
-            vid_tube = np.transpose(vid_tube, (0, 1, 4, 2, 3))  # (1, fnum, 3, 224, 224)
-            vid_tube = torch.from_numpy(vid_tube)
-            processed_videos.append(vid_tube)
-        processed_videos = torch.cat(processed_videos, 0).float()"""
 
         model, processor = self.load()
         print("running X-CLIP (v)")
         with torch.no_grad():
-            video_features = model.get_video_features(**processor(videos=videos, return_tensors="pt")).float()
+            video_features = model.get_video_features(**processor(videos=videos, return_tensors="pt").to(device)).float()
             video_features = video_features / video_features.norm(dim=-1, keepdim=True)
 
-        return video_features.numpy().tolist()
+        return video_features.cpu().numpy().tolist()
 
     def process_texts(self, texts: list[str]) -> list[np.ndarray]:
         model, processor = self.load()
         print("running X-CLIP (t)")
-        inputs = processor(text=texts, return_tensors="pt", padding=True, truncation=True)
+        inputs = processor(text=texts, return_tensors="pt", padding=True, truncation=True).to(device)
         with torch.no_grad():
             text_features = model.get_text_features(**inputs).float()
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
-        return text_features.numpy()
+        return text_features.cpu().numpy()

@@ -53,7 +53,7 @@ def _resize_mat_cv2(mat: np.ndarray, resolution: tuple[int, int], resize_mode: R
 
 def resize_media(data: BytesIO, content_type: str, nframes: int, resolution: tuple[int, int], resize_mode: ResizeMode) -> list[np.ndarray]:
     frames = []
-    if content_type in ("image/gif", "image/png"):
+    if content_type.startswith("image/"):
         image = Image.open(data)
         if content_type == "image/gif":
             if image.n_frames == 0:
@@ -77,6 +77,7 @@ def resize_media(data: BytesIO, content_type: str, nframes: int, resolution: tup
         video = cv2.VideoCapture(source=data, apiPreference=cv2.CAP_FFMPEG, params=[])
         total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
         if total_frames == 0:
+            
             return []
         if total_frames < nframes:
             for _ in range(total_frames):

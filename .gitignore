@@ -1,7 +1,6 @@
-frecency_user_settings.txt
-indexes/*.index
-indexes/*.names
-.venv/
+server/indexes/*.index
+server/indexes/*.names
+*/.venv/
 __pycache__/
-models/videoclip_xl_v2/VideoCLIP-XL-v2.bin
-cc-webvid2m-4f_stformer_b_16_224.pth.tar
+worker/models/videoclip_xl_v2/VideoCLIP-XL-v2.bin
+worker/models/frozen_in_time/cc-webvid2m-4f_stformer_b_16_224.pth.tar

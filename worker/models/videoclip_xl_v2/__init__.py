@@ -9,6 +9,8 @@ from models.base import BaseModel
 
 from threading import Lock
 
+device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+
 def normalize(data):
     v_mean = np.array([0.485, 0.456, 0.406]).reshape(1,1,3)
     v_std = np.array([0.229, 0.224, 0.225]).reshape(1,1,3)
@@ -25,14 +27,14 @@ class VideoCLIP_XL_v2(BaseModel):
         self.lock = Lock()
         self.videoclip_xl = None
 
-    def load(self) -> nn.Module:
+    def load(self) -> VideoCLIP_XL:
         with self.lock:
             if self.videoclip_xl is None:
                 print("loading VideoCLIP_XL_v2")
                 self.videoclip_xl = VideoCLIP_XL()
-                state_dict = torch.load("models/videoclip_xl_v2/VideoCLIP-XL-v2.bin", map_location="cpu")
+                state_dict = torch.load("models/videoclip_xl_v2/VideoCLIP-XL-v2.bin", map_location=device)
                 self.videoclip_xl.load_state_dict(state_dict)
-                self.videoclip_xl.eval()
+                self.videoclip_xl.to(device).eval()
             return self.videoclip_xl
 
     def unload(self):
@@ -55,7 +57,7 @@ class VideoCLIP_XL_v2(BaseModel):
             vid_tube = np.transpose(vid_tube, (0, 1, 4, 2, 3))  # (1, fnum, 3, 224, 224)
             vid_tube = torch.from_numpy(vid_tube)
             processed_videos.append(vid_tube)
-        processed_videos = torch.cat(processed_videos, 0).float()
+        processed_videos = torch.cat(processed_videos, 0).float().to(device)
 
         videoclip_xl = self.load()
         print("running VideoCLIP_XL_v2 (v)")
@@ -63,14 +65,14 @@ class VideoCLIP_XL_v2(BaseModel):
             video_features = videoclip_xl.vision_model.get_vid_features(processed_videos).float()
             video_features = video_features / video_features.norm(dim=-1, keepdim=True)
 
-        return video_features.numpy().tolist()
+        return video_features.cpu().numpy().tolist()
 
     def process_texts(self, texts: list[str]) -> list[np.ndarray]:
         videoclip_xl = self.load()
         print("running VideoCLIP_XL_v2 (t)")
         with torch.no_grad():
-            text_inputs = text_encoder.tokenize(texts, truncate=True)
+            text_inputs = text_encoder.tokenize(texts, truncate=True).to(device)
             text_features = videoclip_xl.text_model.encode_text(text_inputs).float()
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
-        return text_features.numpy()
+        return text_features.cpu().numpy()

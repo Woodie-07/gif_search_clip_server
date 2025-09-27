@@ -1,0 +1,5 @@
+faiss-cpu
+flask-cors
+flask
+gunicorn
+readerwriterlock
