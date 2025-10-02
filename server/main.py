@@ -15,24 +15,27 @@ from index import UserIndexStore, StateContainer, JobStatus, IndexDestination
 
 STATS_ALLOWED_IP = "127.0.0.1" # IP address allowed to fetch /metrics
 
+# removes question mark and everything after it from a URL
 def strip_url_params(url: str) -> str:
     return url.split('?', 1)[0]
 
+# container classes for updates sent from workers
 class ClientUpdate:
     pass
 
 class StatusUpdate(ClientUpdate):
     def __init__(self, url: str, model: str, status_update: JobStatus):
-        self.url = url
-        self.model = model
-        self.status_update = status_update
+        self.url = url # gif download url, stripped
+        self.model = model # model name of this task
+        self.status_update = status_update # enum representing new status, e.g. processing, completed, or failed
 
 class VCLIPResult(ClientUpdate):
     def __init__(self, url: str, model: str, vector: np.ndarray):
         self.url = url
         self.model = model
-        self.vector = vector
+        self.vector = vector # numpy array of the vector from the clip model sent by the worker
 
+# same here but for a text query rather than GIF
 class TCLIPResult(ClientUpdate):
     def __init__(self, text: str, model: str, vector: np.ndarray):
         self.text = text
@@ -41,53 +44,62 @@ class TCLIPResult(ClientUpdate):
 
 class Worker:
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        # handles to CLIP worker connection streams
         self.reader = reader
         self.writer = writer
 
+        # model name -> number of queued tasks for that model
+        # used when picking which worker to send tasks to (lowest queue length preferred)
         self.v_model_queue_lengths: dict[str, int] = {}
         self.t_model_queue_lengths: dict[str, int] = {}
 
+        # numerical id (simple counter) -> (stripped url/text, model name)
         self.vpending: dict[int, tuple[str, str]] = {}
         self.tpending: dict[int, tuple[str, str]] = {}
 
+        # when a ping is sent, this event is created and waited upon
+        # if timeout reached, means we didn't get pong from worker so we consider it dead
         self.pong_recv_event = None
 
+        # simple counters for generating unique task ids
         self.vtask_counter = 0
         self.ttask_counter = 0
 
+        # worker's reported cost for inference, higher = slower so less preferred
+        # worker queue length is multiplied by this when picking best worker
         self.inference_cost = None
 
+    # helper func to send data immediately
     async def send(self, data):
         self.writer.write(data)
         await self.writer.drain()
 
+    # worker just connected, now we need to read initial info from the worker
     async def initialise(self) -> asyncio.Task:
-        data = await self.reader.readexactly(6)
+        data = await self.reader.readexactly(6) # 1 byte packet id (should be 0x00), 1 byte nmodels, 4 byte inference cost big-endian, all unsigned
         packet_id, nmodels, self.inference_cost = struct.unpack("!BBI", data)
+
         if packet_id != 0x00: raise ValueError("unexected packet id in initialise", packet_id)
+
+        # read worker's reported supported models
         for _ in range(nmodels):
             name_length = await self.reader.readexactly(1)
             model_name = await self.reader.readexactly(name_length[0])
             self.t_model_queue_lengths[model_name.decode("utf-8")] = self.v_model_queue_lengths[model_name.decode("utf-8")] = 0
 
+        # begin sending periodic ping packets to worker to ensure it's still alive
         t = asyncio.create_task(self.pinger())
+        # once the pinger exits (worker dead), call pinger_exited with the current task (will be main recv loop)
         t.add_done_callback(lambda _, task=asyncio.current_task(): task.get_loop().create_task(self.pinger_exited(task)))
         return t
 
-    def _get_avail_models(self, models: set[str], queues: dict[str, int]) -> tuple[set[str], int]:
-        avail = set(queues.keys()) & models
-        return avail, sum(queues[m] for m in avail) * self.inference_cost
-
-    def get_avail_v_models(self, models: set[str]) -> tuple[set[str], int]:
-        return self._get_avail_models(models, self.v_model_queue_lengths)
-
-    def get_avail_t_models(self, models: set[str]) -> tuple[set[str], int]:
-        return self._get_avail_models(models, self.t_model_queue_lengths)
-
+    # after pinger exits, close connection and cancel main recv loop
     async def pinger_exited(self, main_task: asyncio.Task):
         self.writer.close()
         main_task.cancel()
 
+    # send ping packet (0x00) around every 15 secs, waiting up to 10 secs for pong (0x01) response
+    # if no pong received in time, assume worker is dead and exit
     async def pinger(self) -> None:
         while True:
             self.pong_recv_event = asyncio.Event()
@@ -100,6 +112,20 @@ class Worker:
             self.pong_recv_event = None
             await asyncio.sleep(15)
 
+    # get a list of supported models for this worker and the total weighted queue length for those models
+    def _get_avail_models(self, models: set[str], queues: dict[str, int]) -> tuple[set[str], int]:
+        avail = set(queues.keys()) & models
+        return avail, sum(queues[m] for m in avail) * self.inference_cost
+
+    # for video CLIP
+    def get_avail_v_models(self, models: set[str]) -> tuple[set[str], int]:
+        return self._get_avail_models(models, self.v_model_queue_lengths)
+
+    # for text CLIP
+    def get_avail_t_models(self, models: set[str]) -> tuple[set[str], int]:
+        return self._get_avail_models(models, self.t_model_queue_lengths)
+
+    # read 8 byte job id and 8 byte vector length, then read vector data load it into a ndarray
     async def read_id_vector(self) -> tuple[int, np.ndarray]:
         data = await self.reader.readexactly(16)
         id, vector_len = struct.unpack("!QQ", data)
@@ -108,6 +134,7 @@ class Worker:
         vector = np.load(vector_data)
         return id, vector
 
+    # main recv loop, yields ClientUpdate objects as they are received
     async def read_packets(self) -> AsyncIterator[ClientUpdate]:
         while True:
             #print("reading packet")
@@ -115,52 +142,63 @@ class Worker:
             packet_id = data[0]
             #print(f"got packet {packet_id}")
             match packet_id:
-                case 0x00:
-                    raise ValueError("unexpected initialise packet during main read")
-                case 0x01:
-                    if self.pong_recv_event is None:
+                case 0x00: # init
+                    raise ValueError("unexpected initialise packet during main read") # 0x00 should only be sent once at start which we should've already handled
+                case 0x01: # pong
+                    if self.pong_recv_event is None: # we got a pong without sending a ping??
                         raise ValueError("received unexpected pong packet")
-                    self.pong_recv_event.set()
-                case 0x02:
-                    data = await self.reader.readexactly(9)
+                    self.pong_recv_event.set() # alert pinger that pong recv'd
+                case 0x02: # video CLIP job status update
+                    data = await self.reader.readexactly(9) # 8 byte job id, 1 byte status
                     id, status = struct.unpack("!QB", data)
-                    status = JobStatus.FAILED if status == 0 else JobStatus.PROCESSING 
-                    if status == JobStatus.FAILED:
+                    # only two possible status updates atm
+                    # downloading status is assumed as soon as job is sent to worker
+                    status = JobStatus.FAILED if status == 0 else JobStatus.PROCESSING
+                    if status == JobStatus.FAILED: # download failure
+                        # remove job id -> (url, model) mapping and decrement queue length for that model
                         d = self.vpending.pop(id)
                         self.v_model_queue_lengths[d[1]] -= 1
                     else:
-                        d = self.vpending[id]
+                        d = self.vpending[id] # status update of job downloading -> processing
                     print(f"got job {id} status update, new status {status.name}")
                     yield StatusUpdate(*d, status)
-                case 0x03:
+                case 0x03: # video CLIP result vector
                     id, vector = await self.read_id_vector()
                     print(f"vclip job {id} complete, received vector of shape {vector.shape}")
                     d = self.vpending.pop(id)
                     self.v_model_queue_lengths[d[1]] -= 1
                     yield VCLIPResult(*d, vector)
-                case 0x04:
+                case 0x04: # text CLIP result vector
                     id, vector = await self.read_id_vector()
                     print(f"tclip job {id} complete, received vector of shape {vector.shape}")
                     d = self.tpending.pop(id)
                     self.t_model_queue_lengths[d[1]] -= 1
                     yield TCLIPResult(*d, vector)
-                case _:
+                case _: # ??
                     raise ValueError("unknown packet ID", packet_id)
-                
+            
+    # we have some video CLIP work to do. we have the GIF download URL and its URL param stripped form along with the set of models to pass it through
     async def submit_vclip_task(self, url: str, stripped: str, models: set[str]):
+        # 1 byte packet id (0x01), 8 byte task id, 4 byte url length, url data, 1 byte nmodels, nmodels * 1 byte model indices
         data = struct.pack("!BQI", 0x01, self.vtask_counter, len(url)) + url.encode("utf-8") + bytes([len(models)])
         for i, model in enumerate(models):
-            self.vpending[self.vtask_counter + i] = (stripped, model)
+            self.vpending[self.vtask_counter + i] = (stripped, model) # store id -> (url, model) mapping
+            # find requested model's index for this worker
+            # happens to be in correct order since we read them in order during initialise
             for i, key in enumerate(self.v_model_queue_lengths):
                 if key == model:
                     data += bytes([i])
-                    self.v_model_queue_lengths[key] += 1
+                    self.v_model_queue_lengths[key] += 1 # also increment queue length for that model
                     break
             else:
-                assert False
+                assert False # we got asked to run a model this worker doesn't support??
+        
+        # task ids are unique per model, so if we send 3 models for one URL, they get 3 consecutive ids
+        # hence, increment counter by number of models so we have no overlap next time
         self.vtask_counter += len(models)
         await self.send(data)
 
+    # same here but for text CLIP
     async def submit_tclip_task(self, text: str, models: set[str]):
         data = struct.pack("!BQI", 0x02, self.ttask_counter, len(text)) + text.encode("utf-8") + bytes([len(models)])
         for i, model in enumerate(models):
@@ -176,22 +214,26 @@ class Worker:
         await self.send(data)
 
 class Server:
-
+    
     def __init__(self):
-        self.workers: set[Worker] = set()
-        self.workers_lock = threading.Lock()
-        self.event_loop: asyncio.AbstractEventLoop = None
+        self.workers: set[Worker] = set() # stores all currently available workers
+        self.workers_lock = threading.Lock() # we need this lock bc metrics thread can read the set while server task modifies it
+        self.event_loop: asyncio.AbstractEventLoop = None # set in run(), handle to server's event loop used so flask thread can schedule tasks on the server thread
 
+        # indexes for storing all vectors ever computed, used to avoid recomputing vectors for same URL/text across different users
         self.global_v_index = UserIndexStore("global_v")
         self.global_t_index = UserIndexStore("global_t")
         
-        self.pending_v: dict[str, dict[str, StateContainer]] = {}
-        self.pending_v_lock = threading.Lock()
-        self.pending_t: defaultdict[str, dict[str, tuple[Future, set[str]]]] = defaultdict(dict)
-        self.pending_t_lock = threading.Lock()
+        self.pending_v: dict[str, dict[str, StateContainer]] = {} # stripped url -> model name -> StateContainer
+        self.pending_v_lock = threading.Lock() # read by metrics
+        self.pending_t: defaultdict[str, dict[str, tuple[Future, set[str]]]] = defaultdict(dict) # text -> model name -> (Future, set of user keys waiting on this for metrics)
+        self.pending_t_lock = threading.Lock() # read by metrics
 
+        # urls that failed to download, so we don't keep retrying them
+        # unstripped so if it's just e.g. discord CDN params expired, we retry next time we see different params
         self.failed_urls = set()
 
+    # listen for incoming connections from workers and run handle_client for each
     async def run(self):
         server = await asyncio.start_server(self.handle_client, '0.0.0.0', 30456)
         self.event_loop = asyncio.get_event_loop()
@@ -199,6 +241,7 @@ class Server:
         async with server:
             await server.serve_forever()
 
+    # from pending_v, remove and return the StateContainer for a given url and model
     def pop_pending_v(self, url: str, model: str) -> StateContainer:
         with self.pending_v_lock:
             sc = self.pending_v[url].pop(model)
@@ -206,6 +249,7 @@ class Server:
                 self.pending_v.pop(url)
             return sc
     
+    # same here but for pending_t
     def pop_pending_t(self, text: str, model: str) -> Future:
         with self.pending_t_lock:
             f, _ = self.pending_t[text].pop(model)
@@ -213,11 +257,12 @@ class Server:
                 self.pending_t.pop(text)
             return f
 
+    # new worker!
     async def handle_client(self, *args):
         worker = Worker(*args)
         pinger = None
         try:
-            pinger = await worker.initialise()
+            pinger = await worker.initialise() # hold a handle to the pinger task so we can cancel it later if needed
             with self.workers_lock:
                 self.workers.add(worker)
 
@@ -225,28 +270,33 @@ class Server:
             
             async for packet in worker.read_packets():
                 if isinstance(packet, StatusUpdate):
+                    # status update for vclip task, update StateContainer and if failed, mark url as failed
                     sc = self.pending_v[packet.url][packet.model]
                     sc.set_state(packet.status_update)
                     if packet.status_update == JobStatus.FAILED:
                         self.pop_pending_v(packet.url, packet.model)
                         self.failed_urls.add(sc.get_data())
                 elif isinstance(packet, VCLIPResult):
+                    # vclip complete, add vector to global index and to each user's index that requested it
                     self.global_v_index.add(packet.url, packet.model, packet.vector)
                     self.pop_pending_v(packet.url, packet.model).index(packet.model, packet.vector)
                 elif isinstance(packet, TCLIPResult):
+                    # same for tclip
                     self.global_t_index.add(packet.text, packet.model, packet.vector)
                     self.pop_pending_t(packet.text, packet.model).set_result(packet.vector)
                 else:
-                    assert False
+                    assert False # worker yielded an unknown packet type??
         except Exception as e:
             print(f"worker disconnect: {e}")
             traceback.print_exc()
         finally:
+            # worker disconnected for whatever reason
             print("worker cleanup")
             if pinger: pinger.cancel()
             with self.workers_lock:
                 self.workers.discard(worker)
 
+            # for each pending vclip task, find a new worker to send it to
             grouped: defaultdict[str, defaultdict[IndexDestination, set[str]]] = defaultdict(lambda: defaultdict(set))
             for url, model in worker.vpending.values():
                 models = self.pending_v[url]
@@ -259,7 +309,18 @@ class Server:
 
             for url, dests in grouped.items():
                 for dest, models in dests.items():
-                    await self._index(dest.user_index, dest.name, models, url)
+                    await self._index(dest.user_index, dest.name, models, url) # find a new home for this task
+
+            # now same for tclip tasks
+            # text -> [(model name, future)]
+            # i think this is right? i'm tired...
+            grouped_t: defaultdict[str, list[tuple[str, Future]]] = defaultdict(list)
+            for text, model in worker.tpending.values():
+                f, _ = self.pending_t[text][model]
+                grouped_t[text].append((model, f))
+
+            for text, models in grouped_t.items():
+                await self._get_text_vectors(text, models)
 
     def find_best_worker(self, models: set[str], is_video: bool):
         best = (set(), 0, None)
@@ -458,13 +519,22 @@ def search(user_key):
     text = request.args.get("text")
     if not text:
         return error("Missing 'text' parameter"), 400
+    
+    k = request.args.get("k")
+    if not k:
+        k = 20
+    else:
+        try:
+            k = int(k)
+        except ValueError:
+            return error("Invalid 'k' parameter"), 400
 
     models = set(request.args.get("models").split(","))
 
-    # return top 10 results for each model
+    # return top k results for each model
     return jsonify({
         "status": "ok",
-        "results": {model: get_user_index(user_key).search(model, np.array([vector]), k=10)[0] for model, vector in server.get_text_vectors(text, models, user_key) if vector is not None}
+        "results": {model: get_user_index(user_key).search(model, np.array([vector]), k=k)[0] for model, vector in server.get_text_vectors(text, models, user_key) if vector is not None}
         }), 200
 
 @app.route('/<user_key>/status/<name>', methods=['GET'])

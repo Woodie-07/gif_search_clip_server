@@ -130,10 +130,10 @@ class Index:
             os.remove(f"indexes/{self.name}.names")
 
 class JobStatus(IntEnum):
-    DOWNLOADING = 0
-    FAILED = 1
-    PROCESSING = 2
-    COMPLETED = 3
+    DOWNLOADING = 0 # job submitted to worker, waiting for it to be downloaded, decoded, and placed into CLIP queue
+    FAILED = 1 # download failed, likely GIF deleted
+    PROCESSING = 2 # in queue to be processed by CLIP model
+    #COMPLETED = 3 # all done! (unused)
 
 # combines multiple faiss indexes (one for each model) into one container for a single user
 # also tracks the state of each indexing job
