@@ -27,6 +27,3 @@ Inside the `worker` working directory
 
 ## Usage
 Install the [Vencord plugin](https://github.com/Woodie-07/clipFavGifSearch)
-
-
-<small>SoM: GitHub Copilot autocomplete was used in this project.</small>
